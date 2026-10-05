@@ -40,3 +40,8 @@ Python 3.12 managed by uv, already initialized in this repo. Always go through u
 - `uv sync` — sync the environment to the lockfile
 
 Do not use pip, create a venv manually, or edit dependencies in `pyproject.toml` by hand.
+
+## Creating commits
+
+Be very concise. Do not provide too many details.
+Do not have a coauthor on any commits. The only author will be Rian Butala, or rianbutala.xyz, or github @flappybird1084

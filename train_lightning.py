@@ -13,6 +13,12 @@ via manual optimization: gradient accumulation, clipping, the schedule, and
 stepping the two optimizers. Lightning's automatic optimization drives a
 single optimizer, and the two-optimizer split is the point of this trainer.
 
+Multi-GPU: set n_gpus (choose which ones with CUDA_VISIBLE_DEVICES) and
+Lightning runs DDP. grad_accum_steps shrinks to match, so the effective
+batch, the step count, and the schedule are all still train.py's. Each rank
+trains on its own hash-routed share of FineWeb; validation runs the full val
+set on every rank, so the val loss is exactly the single-GPU number.
+
 Rough equivalences with train.py's loop, since Lightning counts in
 micro-batches (one DataLoader batch) rather than optimizer steps:
     limit_train_batches = total_steps * grad_accum_steps
@@ -27,6 +33,7 @@ import time
 
 import lightning as L
 import torch
+from lightning.pytorch.utilities import rank_zero_only
 from torch.utils.data import DataLoader
 
 from components.dataset.loader import StreamingTokens, limit_malloc_arenas
@@ -65,7 +72,8 @@ val_percent = 1  # 1 in 100 fineweb documents is held out for eval (hash-routed)
 # training
 seq_len = 1024
 batch_size = 8  # per forward pass; fits a 16GB card with room to spare
-grad_accum_steps = 8  # effective batch = batch_size * this
+n_gpus = 1  # DDP across this many GPUs; must divide 8
+grad_accum_steps = 8 // n_gpus  # effective batch = batch_size * this * n_gpus = 64
 n_workers = 1  # one worker tokenizes far faster than the GPU consumes, and
 # every extra worker duplicates the whole streaming footprint
 
@@ -92,6 +100,8 @@ max_checkpoints = 5  # older ones are deleted (finished runs live in subdirs)
 compile_model = True  # torch.compile, one graph per module (see compile_modules)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # -------------------------------------------------------------------
+
+print0 = rank_zero_only(print)  # under DDP, only rank 0 prints
 
 
 def split_params(model: Thonk):
@@ -166,20 +176,23 @@ class LitThonk(L.LightningModule):
             for n, p in self.model.named_parameters()
             if "emb" in n or ".ple." in n or "lm_head" in n
         )
-        print(
+        print0(
             f"params: {n_total / 1e6:.1f}M total, {(n_total - n_emb) / 1e6:.1f}M non-embedding"
         )
 
         self.step_idx = 0  # optimizer steps completed — train.py's `step`
         self.loss_accum = 0.0
         self.val_losses = []
+        self.last_eval_step = None
 
     # ---- data ----
 
     def train_dataloader(self):
-        return make_loader(
-            MixedTokens(seq_len, wiki_docs, wiki_frac, fineweb_phases), n_workers
+        dataset = MixedTokens(
+            seq_len, wiki_docs, wiki_frac, fineweb_phases,
+            rank=self.global_rank, world_size=self.trainer.world_size,
         )
+        return make_loader(dataset, n_workers)
 
     def val_dataloader(self):
         # One fixed val set (pure held-out fineweb — the mixture never touches
@@ -187,7 +200,7 @@ class LitThonk(L.LightningModule):
         # re-streaming every eval would waste downloads, and a fixed set keeps
         # val losses comparable. Lightning calls this once and keeps the
         # loader. batch_size=None hands each pre-batched (x, y) through as-is.
-        print("materializing val set...")
+        print0("materializing val set...")
         stream = iter(make_loader(StreamingTokens(*FINEWEB, "val", seq_len, val_percent), 0))
         val_set = [next(stream) for _ in range(eval_batches)]
         return DataLoader(val_set, batch_size=None)
@@ -196,7 +209,7 @@ class LitThonk(L.LightningModule):
 
     def configure_optimizers(self):
         muon_params, adamw_params = split_params(self.model)
-        print(f"muon tensors: {len(muon_params)}, adamw tensors: {len(adamw_params)}")
+        print0(f"muon tensors: {len(muon_params)}, adamw tensors: {len(adamw_params)}")
         return [
             Muon(
                 muon_params, lr=muon_lr, momentum=muon_momentum, weight_decay=weight_decay
@@ -233,9 +246,9 @@ class LitThonk(L.LightningModule):
         self.model.zero_grad(set_to_none=True)
         if self.device.type == "cuda":
             peak = torch.cuda.max_memory_allocated() / 2**30
-            print(f"dry run ok | peak GPU memory {peak:.1f} GiB")
+            print0(f"dry run ok | peak GPU memory {peak:.1f} GiB")
         else:
-            print("dry run ok")
+            print0("dry run ok")
 
     def on_train_start(self):
         self.t0 = time.time()
@@ -266,9 +279,11 @@ class LitThonk(L.LightningModule):
             dt = time.time() - self.t0
             self.t0 = time.time()
             tok_per_s = (
-                log_every * grad_accum_steps * batch_size * seq_len / dt if step else 0
+                log_every * grad_accum_steps * n_gpus * batch_size * seq_len / dt
+                if step
+                else 0
             )
-            print(
+            print0(
                 f"step {step:6d} | loss {self.loss_accum:.4f} | lr_mult {mult:.3f} | {tok_per_s:,.0f} tok/s"
             )
 
@@ -285,7 +300,8 @@ class LitThonk(L.LightningModule):
     def on_validation_epoch_end(self):
         val_loss = sum(self.val_losses) / len(self.val_losses)
         self.val_losses = []
-        print(f"step {self.step_idx:6d} | val loss {val_loss:.4f}")
+        self.last_eval_step = self.step_idx
+        print0(f"step {self.step_idx:6d} | val loss {val_loss:.4f}")
         if not self.trainer.sanity_checking:  # the pre-training look isn't worth saving
             self.save_checkpoint()
 
@@ -293,7 +309,7 @@ class LitThonk(L.LightningModule):
         # train.py always evaluates and saves at the last step. Lightning only
         # validates on val_check_interval boundaries, so when total_steps
         # doesn't land on one, do the final eval by hand on the same val set.
-        if os.path.exists(self.checkpoint_path()):
+        if self.last_eval_step == self.step_idx:
             return
         self.model.eval()
         losses = []
@@ -302,13 +318,17 @@ class LitThonk(L.LightningModule):
                 _, loss = self.model(x.to(self.device), y.to(self.device))
                 losses.append(loss.item())
         self.model.train()
-        print(f"step {self.step_idx:6d} | val loss {sum(losses) / len(losses):.4f}")
+        print0(f"step {self.step_idx:6d} | val loss {sum(losses) / len(losses):.4f}")
         self.save_checkpoint()
 
     def checkpoint_path(self):
         return os.path.join(checkpoint_dir, f"step_{self.step_idx:06d}.pt")
 
     def save_checkpoint(self):
+        # Under multi-GPU every rank holds the same weights; if each one wrote
+        # and pruned, they would race on the same files.
+        if not self.trainer.is_global_zero:
+            return
         os.makedirs(checkpoint_dir, exist_ok=True)
         torch.save(
             {"model": self.model.state_dict(), "config": self.cfg, "step": self.step_idx},
@@ -326,7 +346,7 @@ def main():
 
     trainer = L.Trainer(
         accelerator="gpu" if device == "cuda" else "cpu",
-        devices=1,
+        devices=n_gpus,
         precision="bf16-mixed",  # fp32 weights, bf16 autocast — as in train.py
         max_epochs=1,  # the stream is endless; limit_train_batches ends the run
         limit_train_batches=total_steps * grad_accum_steps,
@@ -339,6 +359,9 @@ def main():
         enable_checkpointing=False,
         enable_progress_bar=False,
         enable_model_summary=False,
+        # Every rank evaluates the whole val set (it's only eval_batches
+        # long) rather than a DistributedSampler slice of it.
+        use_distributed_sampler=False,
     )
     trainer.fit(LitThonk())
 

@@ -63,11 +63,15 @@ class MixedTokens(torch.utils.data.IterableDataset):
         wiki_docs: int,
         wiki_frac: float,
         fineweb_phases: tuple[tuple[str, str], ...] = (FINEWEB,),
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.seq_len = seq_len
         self.wiki_docs = wiki_docs
         self.wiki_frac = wiki_frac
         self.fineweb_phases = fineweb_phases
+        self.rank = rank  # FineWeb is sharded across GPUs; the wiki slice is not
+        self.world_size = world_size
 
     def _fineweb(self):
         """Each phase's (repo, pattern) streamed to exhaustion, in order.
@@ -79,7 +83,10 @@ class MixedTokens(torch.utils.data.IterableDataset):
         for i, (repo, pattern) in enumerate(self.fineweb_phases):
             if len(self.fineweb_phases) > 1:
                 print(f"fineweb phase {i + 1}/{len(self.fineweb_phases)}: {pattern}")
-            yield from StreamingTokens(repo, pattern, "train", self.seq_len)
+            yield from StreamingTokens(
+                repo, pattern, "train", self.seq_len,
+                rank=self.rank, world_size=self.world_size,
+            )
 
     def __iter__(self):
         fineweb = self._fineweb()

@@ -8,7 +8,9 @@ next-token target) windows.
 Train/val split: each document is routed by a hash of its id — val gets
 val_percent in every 100. Hash routing is deterministic no matter how files
 are divided across DataLoader workers, so the two splits can never bleed
-into each other.
+into each other. The same hash shards the train documents across GPUs when
+a run is multi-GPU (rank / world_size), so every rank reads the same files
+but trains on its own documents.
 
 Three things here exist purely to keep worker memory sane (a worker once
 cost 20+GB of RAM, growing by the minute):
@@ -75,6 +77,8 @@ class StreamingTokens(torch.utils.data.IterableDataset):
         seq_len: int,
         val_percent: int = 1,
         shuffle_buffer: int = 1000,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         assert split in ("train", "val")
         self.repo = repo
@@ -83,13 +87,22 @@ class StreamingTokens(torch.utils.data.IterableDataset):
         self.seq_len = seq_len
         self.val_percent = val_percent
         self.shuffle_buffer = shuffle_buffer
+        self.rank = rank
+        self.world_size = world_size
 
     def _documents(self, files):
         for path in files:
             for row in parquet_rows(path, ["id", "text"]):
-                is_val = zlib.crc32(row["id"].encode()) % 100 < self.val_percent
-                if is_val == (self.split == "val"):
-                    yield row["text"]
+                h = zlib.crc32(row["id"].encode())
+                is_val = h % 100 < self.val_percent
+                if is_val != (self.split == "val"):
+                    continue
+                # Rank routing uses the hash's higher digits, so a rank's
+                # share doesn't line up with the val digit. (Sharding by file
+                # instead would be lopsided: a phase has only 3-5 files.)
+                if self.split == "train" and h // 100 % self.world_size != self.rank:
+                    continue
+                yield row["text"]
 
     def _windows(self, files):
         buf = []
